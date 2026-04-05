@@ -58,6 +58,17 @@ const state = {
   networkLatencyMs: 0,        // Estimated one-way delay (ms), updated on every sync received
   serverTimeOffset: 0,        // Local clock vs Firebase server clock difference (ms)
 
+  // WebRTC Voice Chat state
+  voice: {
+    isActive:      false,    // Voice call currently running
+    isMuted:       false,    // Local mic muted
+    localStream:   null,     // MediaStream from getUserMedia
+    peerConn:      null,     // RTCPeerConnection
+    sigRef:        null,     // Firebase ref for signaling
+    analyser:      null,     // Web Audio analyser node (for volume bars)
+    animFrame:     null,     // requestAnimationFrame handle for visualizer
+  },
+
   db:          null,          // Firebase database reference
   roomRef:     null,          // Firebase ref for /rooms/{roomId}
   stateRef:    null,          // Firebase ref for /rooms/{roomId}/state
@@ -121,6 +132,19 @@ const dom = {
 
   // Toast
   toast:          document.getElementById('toast'),
+
+  // Voice Chat
+  btnVoice:       document.getElementById('btn-voice'),
+  btnMute:        document.getElementById('btn-mute'),
+  muteBtnText:    document.getElementById('mute-btn-text'),
+  voiceBtnText:   document.getElementById('voice-btn-text'),
+  micIconOn:      document.getElementById('mic-icon-on'),
+  micIconOff:     document.getElementById('mic-icon-off'),
+  voiceStatus:    document.getElementById('voice-status'),
+  voiceStatusText:document.getElementById('voice-status-text'),
+  voiceVisualizer:document.getElementById('voice-visualizer'),
+  remoteAudio:    document.getElementById('remote-audio'),
+  volBars:        document.querySelectorAll('.vol-bar'),
 };
 
 /* ──────────────────────────────────────────────────────────────
@@ -662,6 +686,9 @@ function handleLocalFileUpload(file) {
   dom.localVideo.classList.remove('hidden');
   dom.localVideo.load();
 
+  // Stop voice call if active
+  if (state.voice.isActive) stopVoice();
+
   // Destroy YT player if it exists
   if (state.ytPlayer) {
     state.ytPlayer.destroy();
@@ -954,6 +981,10 @@ function attachEventListeners() {
   dom.chatInput.addEventListener('keydown', e => {
     if (e.key === 'Enter') sendChatMessage();
   });
+
+  // ── Voice Chat ────────────────────────────────────────
+  dom.btnVoice.addEventListener('click', toggleVoice);
+  dom.btnMute.addEventListener('click', toggleMute);
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -989,3 +1020,316 @@ function init() {
 
 // Boot the app when DOM is ready
 document.addEventListener('DOMContentLoaded', init);
+
+/* ──────────────────────────────────────────────────────────────
+   SECTION 19: WEBRTC VOICE CHAT
+   Peer-to-peer audio using WebRTC.
+   Firebase Realtime Database is used only for signaling
+   (exchanging SDP offers/answers and ICE candidates).
+   After the connection is established, audio flows directly
+   between the two browsers — no server involved.
+
+   Flow:
+     Caller  → creates offer → writes to Firebase
+     Callee  → reads offer  → creates answer → writes to Firebase
+     Both    → exchange ICE candidates via Firebase
+     Result  → direct P2P audio connection ✓
+────────────────────────────────────────────────────────────── */
+
+// Free public STUN servers — help peers discover each other's public IP
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+  ],
+};
+
+/**
+ * Toggle voice call on/off.
+ */
+async function toggleVoice() {
+  if (state.voice.isActive) {
+    stopVoice();
+  } else {
+    await startVoice();
+  }
+}
+
+/**
+ * Start voice call:
+ *  1. Request microphone access
+ *  2. Create RTCPeerConnection
+ *  3. If we are the "initiator" (host), create and send an offer
+ *  4. Listen for the remote answer and ICE candidates
+ */
+async function startVoice() {
+  setVoiceStatus('connecting', 'Requesting mic…');
+
+  try {
+    // Step 1 — Get microphone stream
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    state.voice.localStream = stream;
+
+    // Step 2 — Create peer connection
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    state.voice.peerConn = pc;
+
+    // Add local audio tracks to the connection
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+    // Step 3 — When remote audio arrives, play it
+    pc.ontrack = (event) => {
+      dom.remoteAudio.srcObject = event.streams[0];
+      setVoiceStatus('connected', 'Voice connected ✓');
+      showToast('🎙️ Voice connected!');
+    };
+
+    // Step 4 — Setup Firebase signaling channel
+    const sigPath = `rooms/${state.roomId}/voice`;
+    state.voice.sigRef = state.db.ref(sigPath);
+
+    // ICE candidate handler — send our candidates to Firebase
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        state.voice.sigRef.child(`${state.userId}_ice`).push(
+          JSON.stringify(event.candidate)
+        );
+      }
+    };
+
+    // Connection state monitoring
+    pc.onconnectionstatechange = () => {
+      console.log('[Voice] Connection state:', pc.connectionState);
+      if (pc.connectionState === 'connected') {
+        setVoiceStatus('connected', 'Voice connected ✓');
+      } else if (pc.connectionState === 'failed') {
+        setVoiceStatus('error', 'Connection failed');
+        showToast('⚠️ Voice connection failed — try again');
+      } else if (pc.connectionState === 'disconnected') {
+        setVoiceStatus('error', 'Partner disconnected');
+      }
+    };
+
+    // Step 5 — Determine role: host initiates (creates offer), guest responds
+    if (state.isHost) {
+      await initiateVoiceCall(pc);
+    } else {
+      await waitForVoiceOffer(pc);
+    }
+
+    // Show controls
+    state.voice.isActive = true;
+    dom.btnVoice.classList.add('active');
+    dom.btnVoice.querySelector('span').textContent = 'End Voice';
+    dom.micIconOn.classList.remove('hidden');
+    dom.micIconOff.classList.add('hidden');
+    dom.btnMute.classList.remove('hidden');
+    dom.voiceVisualizer.classList.remove('hidden');
+
+    // Start volume visualizer
+    startVolumeVisualizer(stream);
+
+  } catch (err) {
+    console.error('[Voice] Start failed:', err);
+    if (err.name === 'NotAllowedError') {
+      setVoiceStatus('error', 'Mic permission denied');
+      showToast('❌ Mic access denied — allow it in browser settings');
+    } else {
+      setVoiceStatus('error', 'Failed to start');
+      showToast('❌ Voice failed: ' + err.message);
+    }
+    stopVoice();
+  }
+}
+
+/**
+ * Host role: create an SDP offer and write it to Firebase.
+ * Then listen for the guest's answer.
+ */
+async function initiateVoiceCall(pc) {
+  setVoiceStatus('connecting', 'Creating offer…');
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // Write offer to Firebase
+  await state.voice.sigRef.child('offer').set(JSON.stringify(offer));
+
+  // Listen for answer from guest
+  state.voice.sigRef.child('answer').on('value', async (snap) => {
+    if (!snap.val() || pc.remoteDescription) return;
+    const answer = JSON.parse(snap.val());
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    setVoiceStatus('connecting', 'Answer received…');
+    // Now listen for guest ICE candidates
+    listenForIceCandidates(pc, 'guest_ice');
+  });
+
+  setVoiceStatus('connecting', 'Waiting for partner…');
+}
+
+/**
+ * Guest role: wait for the host's SDP offer, then respond with an answer.
+ */
+async function waitForVoiceOffer(pc) {
+  setVoiceStatus('connecting', 'Waiting for host…');
+
+  return new Promise((resolve) => {
+    state.voice.sigRef.child('offer').on('value', async (snap) => {
+      if (!snap.val() || pc.remoteDescription) return;
+
+      const offer = JSON.parse(snap.val());
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      // Write answer back to Firebase
+      await state.voice.sigRef.child('answer').set(JSON.stringify(answer));
+
+      // Now listen for host ICE candidates
+      listenForIceCandidates(pc, 'host_ice');
+      setVoiceStatus('connecting', 'Connecting…');
+      resolve();
+    });
+  });
+}
+
+// ICE candidate key mapping — each peer listens for the OTHER's candidates
+// Host writes to "host_ice", guest listens to "host_ice" (and vice versa)
+function getRemoteIceKey() {
+  return state.isHost ? 'guest_ice' : 'host_ice';
+}
+
+/**
+ * Listen for incoming ICE candidates from the remote peer and add them.
+ */
+function listenForIceCandidates(pc, key) {
+  state.voice.sigRef.child(key).on('child_added', (snap) => {
+    const candidate = JSON.parse(snap.val());
+    pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(err => {
+      console.warn('[Voice] ICE candidate error:', err);
+    });
+  });
+}
+
+/**
+ * Stop voice call and clean up everything.
+ */
+function stopVoice() {
+  // Stop all local media tracks
+  if (state.voice.localStream) {
+    state.voice.localStream.getTracks().forEach(t => t.stop());
+    state.voice.localStream = null;
+  }
+
+  // Close peer connection
+  if (state.voice.peerConn) {
+    state.voice.peerConn.close();
+    state.voice.peerConn = null;
+  }
+
+  // Remove signaling data from Firebase
+  if (state.voice.sigRef) {
+    state.voice.sigRef.remove();
+    state.voice.sigRef.off();
+    state.voice.sigRef = null;
+  }
+
+  // Stop volume visualizer
+  if (state.voice.animFrame) {
+    cancelAnimationFrame(state.voice.animFrame);
+    state.voice.animFrame = null;
+  }
+  if (state.voice.analyser) {
+    state.voice.analyser = null;
+  }
+
+  // Reset remote audio
+  dom.remoteAudio.srcObject = null;
+
+  // Reset UI
+  state.voice.isActive = false;
+  state.voice.isMuted  = false;
+  dom.btnVoice.classList.remove('active');
+  dom.btnVoice.querySelector('span').textContent = 'Start Voice';
+  dom.btnMute.classList.add('hidden');
+  dom.btnMute.classList.remove('muted');
+  dom.btnMute.querySelector('span').textContent = 'Mute';
+  dom.voiceVisualizer.classList.add('hidden');
+  dom.volBars.forEach(b => b.style.height = '4px');
+  setVoiceStatus('', 'Not connected');
+}
+
+/**
+ * Toggle local microphone mute on/off.
+ */
+function toggleMute() {
+  if (!state.voice.localStream) return;
+
+  state.voice.isMuted = !state.voice.isMuted;
+
+  state.voice.localStream.getAudioTracks().forEach(track => {
+    track.enabled = !state.voice.isMuted;
+  });
+
+  if (state.voice.isMuted) {
+    dom.btnMute.classList.add('muted');
+    dom.btnMute.querySelector('span').textContent = 'Unmute';
+    showToast('🔇 Mic muted');
+  } else {
+    dom.btnMute.classList.remove('muted');
+    dom.btnMute.querySelector('span').textContent = 'Mute';
+    showToast('🎙️ Mic unmuted');
+  }
+}
+
+/**
+ * Set the voice status indicator text and style.
+ * @param {string} type  - '' | 'connecting' | 'connected' | 'error'
+ * @param {string} text  - Status message to display
+ */
+function setVoiceStatus(type, text) {
+  dom.voiceStatus.className = 'voice-status ' + type;
+  dom.voiceStatusText.textContent = text;
+}
+
+/**
+ * Animate the volume bar visualizer using Web Audio API.
+ * Shows real-time mic input level as 5 animated bars.
+ */
+function startVolumeVisualizer(stream) {
+  try {
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source   = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 32;
+    source.connect(analyser);
+    state.voice.analyser = analyser;
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    const bars = Array.from(dom.volBars);
+
+    function drawBars() {
+      state.voice.animFrame = requestAnimationFrame(drawBars);
+      analyser.getByteFrequencyData(dataArray);
+
+      // Average the frequency data into 5 buckets
+      const bucketSize = Math.floor(dataArray.length / 5);
+      bars.forEach((bar, i) => {
+        const start = i * bucketSize;
+        let sum = 0;
+        for (let j = start; j < start + bucketSize; j++) sum += dataArray[j];
+        const avg    = sum / bucketSize;                 // 0–255
+        const height = 4 + (avg / 255) * 20;            // 4px min, 24px max
+        bar.style.height = height + 'px';
+        bar.style.opacity = state.voice.isMuted ? '0.2' : '0.7';
+      });
+    }
+
+    drawBars();
+  } catch (err) {
+    console.warn('[Voice] Visualizer failed:', err);
+  }
+}
