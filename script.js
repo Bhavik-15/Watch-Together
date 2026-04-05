@@ -71,6 +71,7 @@ const state = {
     analyser:      null,     // Web Audio analyser node (for volume bars)
     animFrame:     null,     // requestAnimationFrame handle for visualizer
     videoSender:   null,     // RTCRtpSender for the video track (so we can replace/remove)
+    silentStream:  null,     // Canvas stream used as placeholder when camera is off
   },
 
   db:          null,          // Firebase database reference
@@ -1089,10 +1090,15 @@ async function startVoice() {
     // inside that SAME stream — no renegotiation, no stale srcObject.
     const silentCanvas = document.createElement('canvas');
     silentCanvas.width = 2; silentCanvas.height = 2;
-    const silentStream = silentCanvas.captureStream(0);
+    // 1fps keeps the track in "live/unmuted" state so replaceTrack() works
+    // correctly and the remote side's srcObject receives frames immediately.
+    // captureStream(0) leaves the track permanently muted which breaks onunmute.
+    const silentStream = silentCanvas.captureStream(1);
     const silentVideoTrack = silentStream.getVideoTracks()[0];
-    silentVideoTrack.enabled = false;
+    // Keep the stream object alive on the sender so replaceTrack can swap into it
     state.voice.videoSender = pc.addTrack(silentVideoTrack, silentStream);
+    // Store the stream ref so startCamera can reuse it for replaceTrack
+    state.voice.silentStream = silentStream;
 
     // Step 5 — Handle incoming remote tracks
     pc.ontrack = (event) => {
@@ -1103,14 +1109,17 @@ async function startVoice() {
         setVoiceStatus('connected', 'Voice connected ✓');
         showToast('🎙️ Voice connected!');
       } else if (track.kind === 'video') {
-        // Set srcObject once here. replaceTrack() later updates the stream
-        // in-place so this reference stays valid forever — no reassign needed.
+        // Set srcObject once. replaceTrack() updates the stream in-place so
+        // this reference stays valid — no reassign needed on camera toggle.
+        // We do NOT rely on onunmute/onmute here because replaceTrack with a
+        // live 1fps canvas track keeps the remote track in "unmuted" state
+        // permanently, so those events never fire reliably.
+        // Instead, the Firebase cam_host/cam_guest flag (listenForRemoteCamState)
+        // is the single source of truth for showing/hiding the remote video.
         dom.remoteVideo.srcObject = event.streams[0];
         dom.remoteVideo.play().catch(e => console.warn('[Video] Remote video play failed:', e));
-        // Only show video when the track actually carries live camera frames
-        track.onunmute = () => showRemoteVideo(true);
-        track.onmute   = () => showRemoteVideo(false);
-        track.onended  = () => showRemoteVideo(false);
+        // If remote cam flag is already true when we receive the track, show immediately
+        if (state.voice.isRemoteCamOn) showRemoteVideo(true);
       }
     };
 
@@ -1315,10 +1324,12 @@ async function stopCamera() {
     state.voice.cameraStream = null;
   }
 
-  // Replace sender track with null so no video is sent
-  if (state.voice.videoSender) {
-    await state.voice.videoSender.replaceTrack(null);
-    // Keep videoSender reference so we can reuse it if camera is toggled back on
+  // Swap back to the silent canvas track (not null) so the transceiver stays
+  // open and the remote side's track doesn't permanently end.
+  // null would close the track direction making it impossible to re-enable camera.
+  if (state.voice.videoSender && state.voice.silentStream) {
+    const silentTrack = state.voice.silentStream.getVideoTracks()[0];
+    if (silentTrack) await state.voice.videoSender.replaceTrack(silentTrack);
   }
 
   // Update local preview PIP
@@ -1417,8 +1428,9 @@ function stopVoice() {
     cancelAnimationFrame(state.voice.animFrame);
     state.voice.animFrame = null;
   }
-  state.voice.analyser   = null;
-  state.voice.videoSender = null;
+  state.voice.analyser    = null;
+  state.voice.videoSender  = null;
+  state.voice.silentStream = null;
 
   // Reset audio/video elements
   dom.remoteAudio.srcObject = null;
