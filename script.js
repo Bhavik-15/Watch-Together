@@ -52,7 +52,11 @@ const state = {
 
   isSyncing:   false,         // ← Critical flag: prevents infinite sync loops
   lastSyncTime: 0,            // Timestamp of last sync write (debounce)
-  syncDebounceMs: 300,        // Min ms between sync writes
+  syncDebounceMs: 100,        // Min ms between sync writes (reduced for snappier response)
+
+  // Latency compensation — tracks estimated one-way network delay
+  networkLatencyMs: 0,        // Estimated one-way delay (ms), updated on every sync received
+  serverTimeOffset: 0,        // Local clock vs Firebase server clock difference (ms)
 
   db:          null,          // Firebase database reference
   roomRef:     null,          // Firebase ref for /rooms/{roomId}
@@ -211,6 +215,13 @@ function initFirebase() {
     const connRef = state.db.ref('.info/connected');
     connRef.on('value', (snap) => {
       setConnectionStatus(snap.val() === true);
+    });
+
+    // Measure clock offset between local machine and Firebase server
+    // Used for latency compensation when applying remote seek positions
+    const offsetRef = state.db.ref('.info/serverTimeOffset');
+    offsetRef.on('value', (snap) => {
+      state.serverTimeOffset = snap.val() || 0;
     });
 
     return true;
@@ -421,16 +432,20 @@ function listenToChat() {
 
 /**
  * Push the current playback state to Firebase.
- * Debounced to prevent rapid writes (e.g. during seeking).
+ * Play/pause events are sent instantly (no debounce).
+ * Seek events are debounced to avoid spamming during scrubbing.
  *
- * @param {string} status  - 'play' | 'pause'
- * @param {number} time    - Current video time in seconds
+ * @param {string} status   - 'play' | 'pause'
+ * @param {number} time     - Current video time in seconds
+ * @param {boolean} isSeek  - True when triggered by a seek action
  */
-function pushStateToFirebase(status, time) {
-  // Debounce: don't write more than once per syncDebounceMs
-  const now = Date.now();
-  if (now - state.lastSyncTime < state.syncDebounceMs) return;
-  state.lastSyncTime = now;
+function pushStateToFirebase(status, time, isSeek = false) {
+  // Only debounce seek events — play/pause should fire immediately
+  if (isSeek) {
+    const now = Date.now();
+    if (now - state.lastSyncTime < state.syncDebounceMs) return;
+    state.lastSyncTime = now;
+  }
 
   if (!state.stateRef) return;
 
@@ -438,7 +453,7 @@ function pushStateToFirebase(status, time) {
     status,
     time,
     updatedBy: state.userId,
-    updatedAt: now,
+    updatedAt: Date.now(),
   }).catch((err) => {
     console.error('[Sync] Failed to push state:', err);
     showToast('⚠️ Sync error — check connection');
@@ -468,12 +483,31 @@ function pushVideoToFirebase(videoId, videoType) {
 /**
  * Apply a remote playback state update to the local player.
  * Uses the isSyncing flag to prevent event echo.
+ * Compensates for network latency when seeking so both players
+ * land at the same effective playback position.
  *
  * @param {object} data  - Firebase state snapshot value
  */
 function applyRemoteState(data) {
   const player = getActivePlayer();
   if (!player) return;
+
+  // Calculate how long this update spent in transit:
+  // (our local clock + server offset) - time the sender wrote it
+  const localNow = Date.now() + state.serverTimeOffset;
+  const transitMs = data.updatedAt ? Math.max(0, localNow - data.updatedAt) : 0;
+  const transitSec = transitMs / 1000;
+
+  // Update our running latency estimate (smoothed average)
+  state.networkLatencyMs = state.networkLatencyMs
+    ? state.networkLatencyMs * 0.7 + transitMs * 0.3
+    : transitMs;
+
+  // If the remote player was playing, the video has advanced by transitSec
+  // while the message was in flight — seek to the compensated position
+  const compensatedTime = data.status === 'play'
+    ? data.time + transitSec
+    : data.time;
 
   // Set the syncing flag — our own event listeners will check this
   state.isSyncing = true;
@@ -482,43 +516,38 @@ function applyRemoteState(data) {
     if (state.videoType === 'youtube' && state.ytPlayer) {
       const currentTime = state.ytPlayer.getCurrentTime();
 
-      // Auto-correct if time is off by more than 1 second
-      if (Math.abs(currentTime - data.time) > 1) {
-        showSyncBanner('Correcting time…');
-        state.ytPlayer.seekTo(data.time, true);
-        setTimeout(hideSyncBanner, 1500);
+      // Tighter threshold: correct if drift > 0.5s (was 1s)
+      if (Math.abs(currentTime - compensatedTime) > 0.5) {
+        state.ytPlayer.seekTo(compensatedTime, true);
       }
 
       if (data.status === 'play') {
         state.ytPlayer.playVideo();
-        setPlaybackStatus('▶', `Playing…`);
+        setPlaybackStatus('▶', 'Playing…');
       } else {
         state.ytPlayer.pauseVideo();
-        setPlaybackStatus('⏸', `Paused`);
+        setPlaybackStatus('⏸', 'Paused');
       }
 
     } else if (state.videoType === 'local') {
       const vid = dom.localVideo;
       const currentTime = vid.currentTime;
 
-      if (Math.abs(currentTime - data.time) > 1) {
-        showSyncBanner('Correcting time…');
-        vid.currentTime = data.time;
-        setTimeout(hideSyncBanner, 1500);
+      if (Math.abs(currentTime - compensatedTime) > 0.5) {
+        vid.currentTime = compensatedTime;
       }
 
       if (data.status === 'play') {
         vid.play().catch(() => {});
-        setPlaybackStatus('▶', `Playing…`);
+        setPlaybackStatus('▶', 'Playing…');
       } else {
         vid.pause();
-        setPlaybackStatus('⏸', `Paused`);
+        setPlaybackStatus('⏸', 'Paused');
       }
     }
   } finally {
-    // Always release the syncing flag after a short delay
-    // (enough time for the player event to fire and be ignored)
-    setTimeout(() => { state.isSyncing = false; }, 300);
+    // Release the syncing flag after player events have fired
+    setTimeout(() => { state.isSyncing = false; }, 200);
   }
 }
 
@@ -668,19 +697,19 @@ function attachLocalVideoListeners() {
   vid.addEventListener('play', () => {
     if (state.isSyncing) return;
     setPlaybackStatus('▶', 'Playing…');
-    pushStateToFirebase('play', vid.currentTime);
+    pushStateToFirebase('play', vid.currentTime, false); // instant — no debounce
   });
 
   vid.addEventListener('pause', () => {
     if (state.isSyncing) return;
     setPlaybackStatus('⏸', `Paused at ${formatTime(vid.currentTime)}`);
-    pushStateToFirebase('pause', vid.currentTime);
+    pushStateToFirebase('pause', vid.currentTime, false); // instant — no debounce
   });
 
   vid.addEventListener('seeked', () => {
     if (state.isSyncing) return;
     const status = vid.paused ? 'pause' : 'play';
-    pushStateToFirebase(status, vid.currentTime);
+    pushStateToFirebase(status, vid.currentTime, true); // debounced — user may still be scrubbing
   });
 }
 
