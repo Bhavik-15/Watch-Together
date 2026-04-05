@@ -835,3 +835,123 @@ html, body {
   opacity: 0.7;
   transition: height 0.08s ease;
 }
+
+/* ══════════════════════════════════════════════════
+   VIDEO CALL OVERLAY
+   Floats over the player-wrap when camera is active
+══════════════════════════════════════════════════ */
+
+/* Floating overlay container — sits over the video player */
+.video-overlay {
+  position: absolute;
+  /* Bottom-left corner by default, draggable feel with margin */
+  bottom: 14px;
+  left: 14px;
+  width: 260px;
+  height: 146px; /* 16:9 */
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: #000;
+  border: 1.5px solid rgba(255,255,255,0.15);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.7);
+  z-index: 20;
+  transition: var(--transition);
+  animation: fadeUp 0.3s ease both;
+}
+
+/* Remote video fills the overlay */
+.remote-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #111;
+}
+
+/* Camera-off placeholder for remote */
+.cam-off-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: var(--bg-2);
+  color: var(--text-3);
+  font-size: 0.75rem;
+}
+
+.cam-off-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--bg-3);
+  border: 2px solid var(--border-hi);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+
+/* Local camera PIP — bottom-right corner of the overlay */
+.local-cam-pip {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  width: 72px;
+  height: 54px; /* ~4:3 enough for face */
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1.5px solid rgba(255,255,255,0.2);
+  background: #000;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+  z-index: 2;
+  transform: scaleX(-1); /* mirror local preview */
+}
+
+/* Local cam-off pip */
+.local-cam-off-pip {
+  position: absolute;
+  bottom: 8px;
+  right: 8px;
+  width: 72px;
+  height: 54px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1.5px solid rgba(255,255,255,0.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  color: var(--text-3);
+  z-index: 2;
+}
+
+/* Camera toggle button */
+.btn-camera {
+  background: transparent;
+  border: 1.5px solid var(--border-hi);
+  color: var(--text-2);
+  padding: 9px 10px;
+  font-size: 0.84rem;
+  border-radius: var(--radius-md);
+  gap: 5px;
+}
+.btn-camera svg { width: 14px; height: 14px; flex-shrink: 0; }
+.btn-camera:hover { border-color: var(--blue); color: var(--blue); }
+.btn-camera.cam-on {
+  background: rgba(91,143,219,0.15);
+  border-color: var(--blue);
+  color: var(--blue);
+}
+.btn-camera.cam-off {
+  background: rgba(232,93,74,0.1);
+  border-color: var(--red);
+  color: var(--red);
+}
