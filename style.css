@@ -761,3 +761,77 @@ html, body {
   .topbar { padding: 0 12px; }
   .video-column { padding: 12px; gap: 10px; }
 }
+
+/* ══════════════════════════════════════════════════
+   VOICE CHAT
+══════════════════════════════════════════════════ */
+.voice-panel { display: flex; flex-direction: column; gap: 10px; }
+
+.voice-controls { display: flex; gap: 8px; align-items: center; }
+
+.btn-voice {
+  flex: 1;
+  background: transparent;
+  border: 1.5px solid var(--border-hi);
+  color: var(--text-2);
+  padding: 9px 14px;
+  font-size: 0.84rem;
+  border-radius: var(--radius-md);
+  gap: 8px;
+}
+.btn-voice svg { width: 15px; height: 15px; flex-shrink: 0; }
+.btn-voice:hover { border-color: var(--green); color: var(--green); }
+.btn-voice.active {
+  background: rgba(92,184,127,0.12);
+  border-color: var(--green);
+  color: var(--green);
+  animation: micPulse 2s ease-in-out infinite;
+}
+@keyframes micPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(92,184,127,0.3); }
+  50%       { box-shadow: 0 0 0 6px rgba(92,184,127,0); }
+}
+
+.btn-mute {
+  background: transparent;
+  border: 1.5px solid var(--border-hi);
+  color: var(--text-2);
+  padding: 9px 12px;
+  font-size: 0.84rem;
+  border-radius: var(--radius-md);
+  gap: 6px;
+}
+.btn-mute svg { width: 14px; height: 14px; }
+.btn-mute:hover { border-color: var(--red); color: var(--red); }
+.btn-mute.muted {
+  background: rgba(232,93,74,0.12);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.voice-status {
+  font-size: 0.78rem;
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.voice-status.connected { color: var(--green); }
+.voice-status.connecting { color: var(--accent); }
+.voice-status.error { color: var(--red); }
+
+/* Volume visualizer bars */
+.voice-visualizer {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 24px;
+}
+.vol-bar {
+  flex: 1;
+  background: var(--green);
+  border-radius: 2px;
+  height: 4px;
+  opacity: 0.7;
+  transition: height 0.08s ease;
+}
