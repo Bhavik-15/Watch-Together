@@ -62,11 +62,15 @@ const state = {
   voice: {
     isActive:      false,    // Voice call currently running
     isMuted:       false,    // Local mic muted
-    localStream:   null,     // MediaStream from getUserMedia
+    isCameraOn:    false,    // Local camera active
+    isRemoteCamOn: false,    // Remote peer's camera active
+    localStream:   null,     // MediaStream from getUserMedia (audio only)
+    cameraStream:  null,     // MediaStream from getUserMedia (video)
     peerConn:      null,     // RTCPeerConnection
     sigRef:        null,     // Firebase ref for signaling
     analyser:      null,     // Web Audio analyser node (for volume bars)
     animFrame:     null,     // requestAnimationFrame handle for visualizer
+    videoSender:   null,     // RTCRtpSender for the video track (so we can replace/remove)
   },
 
   db:          null,          // Firebase database reference
@@ -145,6 +149,18 @@ const dom = {
   voiceVisualizer:document.getElementById('voice-visualizer'),
   remoteAudio:    document.getElementById('remote-audio'),
   volBars:        document.querySelectorAll('.vol-bar'),
+
+  // Video Call
+  btnCamera:          document.getElementById('btn-camera'),
+  cameraBtnText:      document.getElementById('camera-btn-text'),
+  camIconOn:          document.getElementById('cam-icon-on'),
+  camIconOff:         document.getElementById('cam-icon-off'),
+  videoOverlay:       document.getElementById('video-overlay'),
+  remoteVideo:        document.getElementById('remote-video'),
+  remoteCamOff:       document.getElementById('remote-cam-off'),
+  remoteCamAvatar:    document.getElementById('remote-cam-avatar'),
+  localCameraPreview: document.getElementById('local-camera-preview'),
+  localCamOffPip:     document.getElementById('local-cam-off-pip'),
 };
 
 /* ──────────────────────────────────────────────────────────────
@@ -985,6 +1001,7 @@ function attachEventListeners() {
   // ── Voice Chat ────────────────────────────────────────
   dom.btnVoice.addEventListener('click', toggleVoice);
   dom.btnMute.addEventListener('click', toggleMute);
+  dom.btnCamera.addEventListener('click', toggleCamera);
 }
 
 /* ──────────────────────────────────────────────────────────────
@@ -1021,9 +1038,14 @@ function init() {
 // Boot the app when DOM is ready
 document.addEventListener('DOMContentLoaded', init);
 
-/// ─────────────────────────────────────────────────────────────
-//   SECTION 19: WEBRTC VOICE CHAT
-// ─────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
+/* ──────────────────────────────────────────────────────────────
+   SECTION 19: WEBRTC VOICE + VIDEO CHAT
+   Peer-to-peer audio/video using WebRTC.
+   Firebase is used only for signaling (SDP + ICE candidates).
+   Audio always flows when voice is active.
+   Video is opt-in per user — camera OFF by default.
+────────────────────────────────────────────────────────────── */
 
 const ICE_SERVERS = {
   iceServers: [
@@ -1034,6 +1056,7 @@ const ICE_SERVERS = {
   ]
 };
 
+/* ── Toggle voice on/off ───────────────────────────────────── */
 async function toggleVoice() {
   if (state.voice.isActive) {
     stopVoice();
@@ -1042,11 +1065,12 @@ async function toggleVoice() {
   }
 }
 
+/* ── Start voice call ─────────────────────────────────────── */
 async function startVoice() {
   setVoiceStatus('connecting', 'Requesting mic…');
 
   try {
-    // Step 1 — Get microphone stream
+    // Step 1 — Get audio-only stream first (camera is off by default)
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     state.voice.localStream = stream;
 
@@ -1054,40 +1078,56 @@ async function startVoice() {
     const pc = new RTCPeerConnection(ICE_SERVERS);
     state.voice.peerConn = pc;
 
-    // Step 3 — Add local audio tracks
+    // Step 3 — Add audio tracks
     stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-    // Step 4 — When remote audio arrives, play it
+    // Step 4 — Add a placeholder video sender (null track) so the remote
+    //          side has a video transceiver ready when we enable camera later
+    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
+    state.voice.videoSender = videoTransceiver.sender;
+
+    // Step 5 — Handle incoming remote tracks
     pc.ontrack = (event) => {
-      console.log('[Voice] Remote track received');
-      dom.remoteAudio.srcObject = event.streams[0];
-      dom.remoteAudio.play().catch(e => console.warn('[Voice] Audio play failed:', e));
-      setVoiceStatus('connected', 'Voice connected ✓');
-      showToast('🎙️ Voice connected!');
-    };
+      const track = event.track;
+      if (track.kind === 'audio') {
+        // Attach audio to the hidden <audio> element
+        dom.remoteAudio.srcObject = event.streams[0];
+        dom.remoteAudio.play().catch(e => console.warn('[Voice] Audio play failed:', e));
+        setVoiceStatus('connected', 'Voice connected ✓');
+        showToast('🎙️ Voice connected!');
+      } else if (track.kind === 'video') {
+        // Attach remote video to the overlay
+        dom.remoteVideo.srcObject = event.streams[0];
+        dom.remoteVideo.play().catch(e => console.warn('[Video] Remote video play failed:', e));
 
-    // Step 5 — Setup Firebase signaling ref
-    const sigPath = `rooms/${state.roomId}/voice`;
-    state.voice.sigRef = state.db.ref(sigPath);
+        // Show/hide the cam-off placeholder based on track state
+        track.onunmute = () => showRemoteVideo(true);
+        track.onmute   = () => showRemoteVideo(false);
+        track.onended  = () => showRemoteVideo(false);
 
-    // Step 6 — ICE candidate handler: write OUR candidates to Firebase
-    // Host writes to 'host_ice', Guest writes to 'guest_ice'
-    const myIceKey = state.isHost ? 'host_ice' : 'guest_ice';
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        console.log('[Voice] Sending ICE candidate via', myIceKey);
-        state.voice.sigRef.child(myIceKey).push(
-          JSON.stringify(event.candidate)
-        );
+        // If track is already live
+        if (!track.muted) showRemoteVideo(true);
       }
     };
 
-    // Step 7 — Start listening for the REMOTE peer's ICE candidates immediately
-    // (must be before offer/answer so no candidates are missed)
+    // Step 6 — Setup Firebase signaling ref
+    const sigPath = `rooms/${state.roomId}/voice`;
+    state.voice.sigRef = state.db.ref(sigPath);
+
+    // Step 7 — ICE: write our candidates to Firebase under our role key
+    const myIceKey = state.isHost ? 'host_ice' : 'guest_ice';
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        state.voice.sigRef.child(myIceKey).push(JSON.stringify(event.candidate));
+      }
+    };
+
+    // Step 8 — Start listening for the REMOTE peer's ICE candidates NOW
+    //          (before offer/answer so zero candidates are dropped)
     const remoteIceKey = state.isHost ? 'guest_ice' : 'host_ice';
     listenForIceCandidates(pc, remoteIceKey);
 
-    // Step 8 — Connection state monitoring
+    // Step 9 — Connection state monitoring
     pc.onconnectionstatechange = () => {
       console.log('[Voice] Connection state:', pc.connectionState);
       if (pc.connectionState === 'connected') {
@@ -1102,21 +1142,24 @@ async function startVoice() {
       }
     };
 
-    // Step 9 — Host creates offer, Guest waits for offer
+    // Step 10 — Host creates offer, Guest waits for offer
     if (state.isHost) {
       await initiateVoiceCall(pc);
     } else {
       await waitForVoiceOffer(pc);
     }
 
-    // Step 10 — Update UI
+    // Step 10b — Start listening for remote camera state changes
+    listenForRemoteCamState();
+
+    // Step 11 — Update UI
     state.voice.isActive = true;
     dom.btnVoice.classList.add('active');
     dom.voiceBtnText.textContent = 'End Voice';
     dom.micIconOn.classList.remove('hidden');
     dom.micIconOff.classList.add('hidden');
     dom.btnMute.classList.remove('hidden');
-    dom.voiceVisualizer.classList.remove('hidden');
+    dom.btnCamera.classList.remove('hidden');  // show camera toggle button
 
     startVolumeVisualizer(stream);
 
@@ -1133,32 +1176,26 @@ async function startVoice() {
   }
 }
 
-/**
- * Host: create SDP offer → write to Firebase → wait for answer
- */
+/* ── Host: create offer → wait for answer ─────────────────── */
 async function initiateVoiceCall(pc) {
   setVoiceStatus('connecting', 'Creating offer…');
 
-  // Clear any stale signaling data first
+  // Clear stale signaling data from any previous session
   await state.voice.sigRef.remove();
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   await state.voice.sigRef.child('offer').set(JSON.stringify(offer));
-  console.log('[Voice] Offer sent, waiting for answer…');
   setVoiceStatus('connecting', 'Waiting for partner…');
 
-  // Listen for guest's answer
   return new Promise((resolve) => {
     state.voice.sigRef.child('answer').on('value', async (snap) => {
       if (!snap.val()) return;
       if (pc.signalingState === 'closed') return;
       if (pc.remoteDescription) return;
-
       try {
         const answer = JSON.parse(snap.val());
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        console.log('[Voice] Answer applied');
         setVoiceStatus('connecting', 'Answer received…');
         resolve();
       } catch (e) {
@@ -1168,9 +1205,7 @@ async function initiateVoiceCall(pc) {
   });
 }
 
-/**
- * Guest: wait for host's offer → create answer → write to Firebase
- */
+/* ── Guest: wait for offer → send answer ─────────────────── */
 async function waitForVoiceOffer(pc) {
   setVoiceStatus('connecting', 'Waiting for host…');
 
@@ -1179,16 +1214,12 @@ async function waitForVoiceOffer(pc) {
       if (!snap.val()) return;
       if (pc.signalingState === 'closed') return;
       if (pc.remoteDescription) return;
-
       try {
         const offer = JSON.parse(snap.val());
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
-
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         await state.voice.sigRef.child('answer').set(JSON.stringify(answer));
-
-        console.log('[Voice] Answer sent');
         setVoiceStatus('connecting', 'Connecting…');
         resolve();
       } catch (e) {
@@ -1198,28 +1229,165 @@ async function waitForVoiceOffer(pc) {
   });
 }
 
-/**
- * Listen for ICE candidates from the remote peer and apply them.
- */
+/* ── ICE candidate listener ───────────────────────────────── */
 function listenForIceCandidates(pc, key) {
-  console.log('[Voice] Listening for ICE candidates on:', key);
   state.voice.sigRef.child(key).on('child_added', async (snap) => {
     if (pc.signalingState === 'closed') return;
     try {
       const candidate = JSON.parse(snap.val());
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log('[Voice] ICE candidate added from', key);
     } catch (err) {
       console.warn('[Voice] ICE candidate error:', err);
     }
   });
 }
 
-/**
- * Stop voice call and clean up everything.
- */
+/* ── Toggle camera on/off ─────────────────────────────────── */
+async function toggleCamera() {
+  if (!state.voice.isActive) return;
+
+  if (state.voice.isCameraOn) {
+    // Turn camera OFF
+    await stopCamera();
+  } else {
+    // Turn camera ON
+    await startCamera();
+  }
+}
+
+/* ── Start local camera ───────────────────────────────────── */
+async function startCamera() {
+  try {
+    const camStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    state.voice.cameraStream = camStream;
+    const videoTrack = camStream.getVideoTracks()[0];
+
+    // Replace the null video sender track with the real camera track
+    if (state.voice.videoSender) {
+      await state.voice.videoSender.replaceTrack(videoTrack);
+    }
+
+    // Show local PIP preview (mirrored via CSS)
+    dom.localCameraPreview.srcObject = camStream;
+    dom.localCameraPreview.classList.remove('hidden');
+    dom.localCamOffPip.classList.add('hidden');
+
+    // Show the overlay (it will show remote cam-off until remote enables theirs)
+    dom.videoOverlay.classList.remove('hidden');
+    showRemoteVideo(state.voice.isRemoteCamOn);
+
+    // Update camera button state
+    state.voice.isCameraOn = true;
+    dom.btnCamera.classList.remove('cam-off');
+    dom.btnCamera.classList.add('cam-on');
+    dom.camIconOn.classList.remove('hidden');
+    dom.camIconOff.classList.add('hidden');
+    dom.cameraBtnText.textContent = 'Cam';
+    showToast('📷 Camera on');
+
+    // Tell the remote peer our camera is on via Firebase flag
+    if (state.voice.sigRef) {
+      state.voice.sigRef.child(`cam_${state.isHost ? 'host' : 'guest'}`).set(true);
+    }
+
+  } catch (err) {
+    console.error('[Video] Camera start failed:', err);
+    if (err.name === 'NotAllowedError') {
+      showToast('❌ Camera access denied');
+    } else {
+      showToast('❌ Camera failed: ' + err.message);
+    }
+  }
+}
+
+/* ── Stop local camera ────────────────────────────────────── */
+async function stopCamera() {
+  // Stop camera tracks
+  if (state.voice.cameraStream) {
+    state.voice.cameraStream.getTracks().forEach(t => t.stop());
+    state.voice.cameraStream = null;
+  }
+
+  // Replace sender track with null (sends black frames — signals cam off)
+  if (state.voice.videoSender) {
+    await state.voice.videoSender.replaceTrack(null);
+  }
+
+  // Update local preview PIP
+  dom.localCameraPreview.srcObject = null;
+  dom.localCameraPreview.classList.add('hidden');
+
+  // If overlay is visible, show our local cam-off pip
+  if (!dom.videoOverlay.classList.contains('hidden')) {
+    dom.localCamOffPip.classList.remove('hidden');
+  }
+
+  // Update state + UI
+  state.voice.isCameraOn = false;
+  dom.btnCamera.classList.remove('cam-on');
+  dom.btnCamera.classList.add('cam-off');
+  dom.camIconOn.classList.add('hidden');
+  dom.camIconOff.classList.remove('hidden');
+  dom.cameraBtnText.textContent = 'Cam';
+  showToast('📷 Camera off');
+
+  // Tell remote peer
+  if (state.voice.sigRef) {
+    state.voice.sigRef.child(`cam_${state.isHost ? 'host' : 'guest'}`).set(false);
+  }
+
+  // Hide overlay entirely if remote camera is also off
+  if (!state.voice.isRemoteCamOn) {
+    dom.videoOverlay.classList.add('hidden');
+  }
+}
+
+/* ── Show/hide remote video vs placeholder ────────────────── */
+function showRemoteVideo(isOn) {
+  state.voice.isRemoteCamOn = isOn;
+  if (isOn) {
+    dom.remoteVideo.classList.remove('hidden');
+    dom.remoteCamOff.style.display = 'none';
+    // Show overlay when remote turns on camera even if we haven't
+    dom.videoOverlay.classList.remove('hidden');
+    if (!state.voice.isCameraOn) {
+      dom.localCamOffPip.classList.remove('hidden');
+    }
+  } else {
+    dom.remoteVideo.classList.add('hidden');
+    dom.remoteCamOff.style.display = 'flex';
+    // Hide overlay if both cameras are off
+    if (!state.voice.isCameraOn) {
+      dom.videoOverlay.classList.add('hidden');
+      dom.localCamOffPip.classList.add('hidden');
+    }
+  }
+}
+
+/* ── Listen for remote camera state changes ───────────────── */
+function listenForRemoteCamState() {
+  if (!state.voice.sigRef) return;
+  const remoteKey = state.isHost ? 'cam_guest' : 'cam_host';
+  state.voice.sigRef.child(remoteKey).on('value', (snap) => {
+    const isOn = snap.val() === true;
+    // Update the avatar letter in the cam-off placeholder
+    if (!isOn) {
+      // We can't know remote name from here easily, just use placeholder
+      dom.remoteCamAvatar.textContent = '?';
+    }
+    showRemoteVideo(isOn);
+  });
+}
+
+/* ── Stop everything ──────────────────────────────────────── */
 function stopVoice() {
-  // Stop local mic tracks
+  // Stop camera first
+  if (state.voice.cameraStream) {
+    state.voice.cameraStream.getTracks().forEach(t => t.stop());
+    state.voice.cameraStream = null;
+  }
+
+  // Stop audio tracks
   if (state.voice.localStream) {
     state.voice.localStream.getTracks().forEach(t => t.stop());
     state.voice.localStream = null;
@@ -1231,9 +1399,9 @@ function stopVoice() {
     state.voice.peerConn = null;
   }
 
-  // Detach Firebase listeners FIRST, then remove data
+  // Detach Firebase listeners BEFORE removing data
   if (state.voice.sigRef) {
-    state.voice.sigRef.off();   // ← must be before .remove()
+    state.voice.sigRef.off();
     state.voice.sigRef.remove();
     state.voice.sigRef = null;
   }
@@ -1243,27 +1411,41 @@ function stopVoice() {
     cancelAnimationFrame(state.voice.animFrame);
     state.voice.animFrame = null;
   }
-  state.voice.analyser = null;
+  state.voice.analyser   = null;
+  state.voice.videoSender = null;
 
-  // Reset audio element
+  // Reset audio/video elements
   dom.remoteAudio.srcObject = null;
+  dom.remoteVideo.srcObject = null;
+  dom.localCameraPreview.srcObject = null;
+
+  // Hide video overlay
+  dom.videoOverlay.classList.add('hidden');
+  dom.localCameraPreview.classList.add('hidden');
+  dom.localCamOffPip.classList.add('hidden');
 
   // Reset UI
-  state.voice.isActive = false;
-  state.voice.isMuted  = false;
+  state.voice.isActive      = false;
+  state.voice.isMuted       = false;
+  state.voice.isCameraOn    = false;
+  state.voice.isRemoteCamOn = false;
+
   dom.btnVoice.classList.remove('active');
   dom.voiceBtnText.textContent = 'Start Voice';
   dom.btnMute.classList.add('hidden');
   dom.btnMute.classList.remove('muted');
   dom.muteBtnText.textContent = 'Mute';
+  dom.btnCamera.classList.add('hidden');
+  dom.btnCamera.classList.remove('cam-on', 'cam-off');
+  dom.camIconOn.classList.remove('hidden');
+  dom.camIconOff.classList.add('hidden');
+  dom.cameraBtnText.textContent = 'Cam';
   dom.voiceVisualizer.classList.add('hidden');
   dom.volBars.forEach(b => b.style.height = '4px');
   setVoiceStatus('', 'Not connected');
 }
 
-/**
- * Toggle mic mute.
- */
+/* ── Mute toggle ──────────────────────────────────────────── */
 function toggleMute() {
   if (!state.voice.localStream) return;
 
@@ -1283,17 +1465,13 @@ function toggleMute() {
   }
 }
 
-/**
- * Set voice status text and style.
- */
+/* ── Voice status helper ──────────────────────────────────── */
 function setVoiceStatus(type, text) {
   dom.voiceStatus.className = 'voice-status ' + type;
   dom.voiceStatusText.textContent = text;
 }
 
-/**
- * Animate volume bars using Web Audio API.
- */
+/* ── Volume visualizer ────────────────────────────────────── */
 function startVolumeVisualizer(stream) {
   try {
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -1309,7 +1487,6 @@ function startVolumeVisualizer(stream) {
     function drawBars() {
       state.voice.animFrame = requestAnimationFrame(drawBars);
       analyser.getByteFrequencyData(dataArray);
-
       const bucketSize = Math.floor(dataArray.length / 5);
       bars.forEach((bar, i) => {
         const start = i * bucketSize;
@@ -1321,9 +1498,8 @@ function startVolumeVisualizer(stream) {
         bar.style.opacity = state.voice.isMuted ? '0.2' : '0.7';
       });
     }
-
     drawBars();
   } catch (err) {
     console.warn('[Voice] Visualizer failed:', err);
   }
-} 
+}
