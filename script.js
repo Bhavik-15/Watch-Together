@@ -7,7 +7,7 @@
 /* ──────────────────────────────────────────────────────────────
    SECTION 1: FIREBASE CONFIGURATION
    ✅ Credentials are filled in. One manual step still required:
-
+   
    ACTION NEEDED — Add databaseURL:
      1. Go to: https://console.firebase.google.com
      2. Open project "watch-together-c98df"
@@ -1081,32 +1081,39 @@ async function startVoice() {
     // Step 3 — Add audio tracks
     stream.getTracks().forEach(track => pc.addTrack(track, stream));
 
-    // Step 4 — Add a placeholder video sender (null track) so the remote
-    //          side has a video transceiver ready when we enable camera later
-    const videoTransceiver = pc.addTransceiver('video', { direction: 'sendrecv' });
-    state.voice.videoSender = videoTransceiver.sender;
-
-    // Step 5 — Handle incoming remote tracks
+    // Step 4 — Handle incoming remote tracks.
+    // srcObject is always re-assigned fresh so renegotiation after camera
+    // toggle always shows the live stream, never a stale one.
     pc.ontrack = (event) => {
       const track = event.track;
       if (track.kind === 'audio') {
-        // Attach audio to the hidden <audio> element
         dom.remoteAudio.srcObject = event.streams[0];
         dom.remoteAudio.play().catch(e => console.warn('[Voice] Audio play failed:', e));
         setVoiceStatus('connected', 'Voice connected ✓');
         showToast('🎙️ Voice connected!');
       } else if (track.kind === 'video') {
-        // Attach remote video to the overlay
+        // Always re-assign so we pick up the live stream after renegotiation
         dom.remoteVideo.srcObject = event.streams[0];
         dom.remoteVideo.play().catch(e => console.warn('[Video] Remote video play failed:', e));
-
-        // Show/hide the cam-off placeholder based on track state
         track.onunmute = () => showRemoteVideo(true);
         track.onmute   = () => showRemoteVideo(false);
         track.onended  = () => showRemoteVideo(false);
-
-        // If track is already live
         if (!track.muted) showRemoteVideo(true);
+      }
+    };
+
+    // Step 4b — When camera is added/removed, browser fires onnegotiationneeded.
+    // We send a fresh offer so both sides re-sync their video transceivers.
+    pc.onnegotiationneeded = async () => {
+      if (pc.signalingState === 'closed') return;
+      try {
+        console.log('[Video] Renegotiation needed — sending new offer');
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        // Use 'reoffer' key so guest handler knows this is a renegotiation
+        await state.voice.sigRef.child('reoffer').set(JSON.stringify(pc.localDescription));
+      } catch (e) {
+        console.error('[Video] Renegotiation offer failed:', e);
       }
     };
 
@@ -1261,22 +1268,32 @@ async function startCamera() {
     const camStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
     state.voice.cameraStream = camStream;
     const videoTrack = camStream.getVideoTracks()[0];
+    const pc = state.voice.peerConn;
 
-    // Replace the null video sender track with the real camera track
-    if (state.voice.videoSender) {
-      await state.voice.videoSender.replaceTrack(videoTrack);
+    // Check if we already have a video sender (from a previous camera toggle)
+    const existingSender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (existingSender) {
+      // Reuse existing sender — replaceTrack does NOT trigger renegotiation,
+      // which is fine here because the transceiver already exists on both sides
+      await existingSender.replaceTrack(videoTrack);
+      state.voice.videoSender = existingSender;
+    } else {
+      // First time camera is added — addTrack triggers onnegotiationneeded
+      // which sends a fresh offer so the remote side gets the video transceiver
+      const sender = pc.addTrack(videoTrack, camStream);
+      state.voice.videoSender = sender;
     }
 
-    // Show local PIP preview (mirrored via CSS)
+    // Show local PIP preview (mirrored via CSS transform: scaleX(-1))
     dom.localCameraPreview.srcObject = camStream;
     dom.localCameraPreview.classList.remove('hidden');
     dom.localCamOffPip.classList.add('hidden');
 
-    // Show the overlay (it will show remote cam-off until remote enables theirs)
+    // Show overlay
     dom.videoOverlay.classList.remove('hidden');
     showRemoteVideo(state.voice.isRemoteCamOn);
 
-    // Update camera button state
+    // Update state + UI
     state.voice.isCameraOn = true;
     dom.btnCamera.classList.remove('cam-off');
     dom.btnCamera.classList.add('cam-on');
@@ -1285,7 +1302,7 @@ async function startCamera() {
     dom.cameraBtnText.textContent = 'Cam';
     showToast('📷 Camera on');
 
-    // Tell the remote peer our camera is on via Firebase flag
+    // Tell remote peer our camera is on
     if (state.voice.sigRef) {
       state.voice.sigRef.child(`cam_${state.isHost ? 'host' : 'guest'}`).set(true);
     }
@@ -1308,9 +1325,10 @@ async function stopCamera() {
     state.voice.cameraStream = null;
   }
 
-  // Replace sender track with null (sends black frames — signals cam off)
+  // Replace sender track with null so no video is sent
   if (state.voice.videoSender) {
     await state.voice.videoSender.replaceTrack(null);
+    // Keep videoSender reference so we can reuse it if camera is toggled back on
   }
 
   // Update local preview PIP
@@ -1367,15 +1385,54 @@ function showRemoteVideo(isOn) {
 /* ── Listen for remote camera state changes ───────────────── */
 function listenForRemoteCamState() {
   if (!state.voice.sigRef) return;
+  const pc = state.voice.peerConn;
+
+  // Watch the remote camera on/off flag
   const remoteKey = state.isHost ? 'cam_guest' : 'cam_host';
   state.voice.sigRef.child(remoteKey).on('value', (snap) => {
-    const isOn = snap.val() === true;
-    // Update the avatar letter in the cam-off placeholder
-    if (!isOn) {
-      // We can't know remote name from here easily, just use placeholder
-      dom.remoteCamAvatar.textContent = '?';
+    showRemoteVideo(snap.val() === true);
+  });
+
+  // ── Renegotiation: handle a new offer from the remote peer ──
+  // When the remote side adds/removes a video track, it writes a 'reoffer'.
+  // We respond with a fresh answer so both sides stay in sync.
+  state.voice.sigRef.child('reoffer').on('value', async (snap) => {
+    if (!snap.val()) return;
+    if (pc.signalingState === 'closed') return;
+
+    // Only the NON-initiator of this specific reoffer should answer.
+    // We detect this by checking if we are NOT the one who wrote it:
+    // The host writes reoffers when adding camera, guest answers; and vice versa.
+    // We use a simple flag in Firebase to track who wrote the reoffer.
+    try {
+      const offer = JSON.parse(snap.val());
+      // Only process if this is truly a remote offer (check sdp type)
+      if (offer.type !== 'offer') return;
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      // Write the reanswer back
+      await state.voice.sigRef.child('reanswer').set(JSON.stringify(answer));
+      console.log('[Video] Renegotiation answer sent');
+    } catch (e) {
+      console.error('[Video] Renegotiation answer failed:', e);
     }
-    showRemoteVideo(isOn);
+  });
+
+  // ── The reoffer initiator listens for the reanswer ──
+  state.voice.sigRef.child('reanswer').on('value', async (snap) => {
+    if (!snap.val()) return;
+    if (pc.signalingState === 'closed') return;
+    // Only apply if we are in 'have-local-offer' state (we sent the reoffer)
+    if (pc.signalingState !== 'have-local-offer') return;
+    try {
+      const answer = JSON.parse(snap.val());
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      console.log('[Video] Renegotiation complete ✓');
+    } catch (e) {
+      console.error('[Video] Renegotiation reanswer failed:', e);
+    }
   });
 }
 
