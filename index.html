@@ -141,6 +141,23 @@
           <div id="yt-player-container" class="hidden"></div>
           <!-- HTML5 video for local files -->
           <video id="local-video" class="local-video hidden" controls></video>
+
+          <!-- Floating video call overlay (shown when voice+camera active) -->
+          <div id="video-overlay" class="video-overlay hidden">
+            <!-- Remote peer's video (large) -->
+            <video id="remote-video" class="remote-video" autoplay playsinline></video>
+            <!-- Camera off placeholder for remote -->
+            <div id="remote-cam-off" class="cam-off-placeholder">
+              <div class="cam-off-avatar" id="remote-cam-avatar">?</div>
+              <span>Camera off</span>
+            </div>
+            <!-- Local camera PIP bottom-right -->
+            <video id="local-camera-preview" class="local-cam-pip hidden" autoplay playsinline muted></video>
+            <!-- Local cam-off pip -->
+            <div id="local-cam-off-pip" class="local-cam-off-pip hidden">
+              <span>You</span>
+            </div>
+          </div>
         </div>
 
         <!-- Playback Status -->
@@ -180,6 +197,11 @@
             <button id="btn-mute" class="btn btn-mute hidden">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
               <span id="mute-btn-text">Mute</span>
+            </button>
+            <button id="btn-camera" class="btn btn-camera hidden" title="Toggle Camera">
+              <svg id="cam-icon-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+              <svg id="cam-icon-off" class="hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="1" y1="1" x2="23" y2="23"/><path d="M9 3H3a2 2 0 00-2 2v11m16.12-2.88L23 17V7l-6 4.12M16 5a2 2 0 012 2v.5"/></svg>
+              <span id="camera-btn-text">Cam</span>
             </button>
           </div>
           <div id="voice-status" class="voice-status">
