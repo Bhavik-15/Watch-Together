@@ -7,7 +7,7 @@
 /* ──────────────────────────────────────────────────────────────
    SECTION 1: FIREBASE CONFIGURATION
    ✅ Credentials are filled in. One manual step still required:
-   
+
    ACTION NEEDED — Add databaseURL:
      1. Go to: https://console.firebase.google.com
      2. Open project "watch-together-c98df"
@@ -1168,7 +1168,7 @@ async function initiateVoiceCall(pc) {
 
   // Listen for answer from guest
   state.voice.sigRef.child('answer').on('value', async (snap) => {
-    if (!snap.val() || pc.remoteDescription) return;
+    if (!snap.val() || pc.signalingState === 'closed' || pc.remoteDescription) return;
     const answer = JSON.parse(snap.val());
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
     setVoiceStatus('connecting', 'Answer received…');
@@ -1187,7 +1187,7 @@ async function waitForVoiceOffer(pc) {
 
   return new Promise((resolve) => {
     state.voice.sigRef.child('offer').on('value', async (snap) => {
-      if (!snap.val() || pc.remoteDescription) return;
+      if (!snap.val() || pc.signalingState === 'closed' || pc.remoteDescription) return;
 
       const offer = JSON.parse(snap.val());
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -1217,6 +1217,7 @@ function getRemoteIceKey() {
  */
 function listenForIceCandidates(pc, key) {
   state.voice.sigRef.child(key).on('child_added', (snap) => {
+    if (pc.signalingState === 'closed') return;
     const candidate = JSON.parse(snap.val());
     pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(err => {
       console.warn('[Voice] ICE candidate error:', err);
@@ -1242,9 +1243,9 @@ function stopVoice() {
 
   // Remove signaling data from Firebase
   if (state.voice.sigRef) {
-    state.voice.sigRef.remove();
     state.voice.sigRef.off();
-    state.voice.sigRef = null;
+  state.voice.sigRef.remove();
+  state.voice.sigRef = null;
   }
 
   // Stop volume visualizer
